@@ -30,6 +30,7 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/pnikolic-amd/ComfyUI_MIGraphX.git
 cd ComfyUI_MIGraphX
 pip install -r requirements.txt
+export PYTHONPATH=/opt/rocm/lib:$PYTHONPATH
 #for best performance
 export MIGRAPHX_MLIR_USE_SPECIFIC_OPS="attention"
 ```
