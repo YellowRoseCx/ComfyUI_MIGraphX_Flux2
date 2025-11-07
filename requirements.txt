@@ -1,1 +1,2 @@
 onnx!=1.16.2
+onnxscript>=0.5.6
