@@ -187,8 +187,15 @@ def convert_model_to_ONNX(onnx_tmp_dir: Union[str, os.PathLike],
     Flux2Class = getattr(comfy.model_base, "Flux2", type("DummyFlux2", (), {}))
     is_flux = isinstance(model.model, FluxClass) or isinstance(model.model, Flux2Class)
     if is_flux:
-        context_dim = model.model.model_config.unet_config.get("context_in_dim", 4096)
-        y_dim = model.model.model_config.unet_config.get("vec_in_dim", 768)
+        # Fetch dimensions safely from the underlying Flux model params
+        context_dim = getattr(transformer, "params", None)
+        if context_dim:
+            context_dim = transformer.params.context_in_dim
+            y_dim = transformer.params.vec_in_dim
+        else:
+            context_dim = 4096
+            y_dim = 768
+
         # Flux2 specific
         if isinstance(model.model, Flux2Class):
             context_len = 512
@@ -219,8 +226,12 @@ def convert_model_to_ONNX(onnx_tmp_dir: Union[str, os.PathLike],
         _flux.transformer_options = transformer_options
         transformer = _flux
 
-        in_channels = model.model.model_config.unet_config.get("in_channels", 64)
-        patch_size = model.model.model_config.unet_config.get("patch_size", 2)
+        if getattr(transformer, "params", None):
+            in_channels = transformer.params.in_channels
+            patch_size = transformer.params.patch_size
+        else:
+            in_channels = model.model.model_config.unet_config.get("in_channels", 64)
+            patch_size = model.model.model_config.unet_config.get("patch_size", 2)
         h_len = ((height // 8) + (patch_size // 2)) // patch_size
         w_len = ((width // 8) + (patch_size // 2)) // patch_size
         num_img_tokens = h_len * w_len
@@ -383,7 +394,10 @@ def load_from_mxr(mxr_file_path: Union[str, os.PathLike]):
 def load_MGX_transformer_model(model: comfy.model_base.BaseModel, force_compile: bool, mxr_file_name: str,
                                 batch_size: int, height: int, width: int, context: bool, data_type: str) -> MgxTransformer:
     transformer_mgx = None
-    patch_size = model.model.model_config.unet_config.get("patch_size", 2)
+    if getattr(model.model.diffusion_model, "params", None):
+        patch_size = model.model.diffusion_model.params.patch_size
+    else:
+        patch_size = model.model.model_config.unet_config.get("patch_size", 2)
     mxr_file_path = create_path(f"mgx_files/{mxr_file_name}")
     if force_compile or not os.path.isfile(mxr_file_path):
         create_dir(create_path("mgx_files"))
