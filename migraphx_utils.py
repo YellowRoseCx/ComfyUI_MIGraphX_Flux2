@@ -36,12 +36,24 @@ class MgxTransformer:
         self.model_data = torch.zeros([1])
         self._allocate_torch_tensors()
     
-    def __call__(self, x, timesteps, context, y=None, control=None, transformer_options=None, **kwargs):
-        self._copy_tensor_sync(self.model_data["x"], x)
-        self._copy_tensor_sync(self.model_data["timesteps"], timesteps)
-        self._copy_tensor_sync(self.model_data["context"], context)
-        if y is not None:
+    def __call__(self, x, timesteps=None, context=None, y=None, guidance=None, control=None, transformer_options=None, **kwargs):
+        if timesteps is None and "timestep" in kwargs:
+            timesteps = kwargs["timestep"]
+
+        if "x" in self.model_data:
+            self._copy_tensor_sync(self.model_data["x"], x)
+
+        if "timestep" in self.model_data and timesteps is not None:
+            self._copy_tensor_sync(self.model_data["timestep"], timesteps)
+        elif "timesteps" in self.model_data and timesteps is not None:
+            self._copy_tensor_sync(self.model_data["timesteps"], timesteps)
+
+        if "context" in self.model_data and context is not None:
+            self._copy_tensor_sync(self.model_data["context"], context)
+        if "y" in self.model_data and y is not None:
             self._copy_tensor_sync(self.model_data["y"], y)
+        if "guidance" in self.model_data and guidance is not None:
+            self._copy_tensor_sync(self.model_data["guidance"], guidance)
 
         mgx_data = self._tensors_to_args()
         self.model.run(mgx_data)
@@ -119,9 +131,63 @@ def convert_model_to_ONNX(onnx_tmp_dir: Union[str, os.PathLike],
         if context_embedder_config is not None:
             context_dim = context_embedder_config.get("params", {}).get("in_features", None)
             if context:
-               context_len = 154 
+               context_len = 154
 
-    if context_dim is not None:
+    FluxClass = getattr(comfy.model_base, "Flux", type("DummyFlux", (), {}))
+    Flux2Class = getattr(comfy.model_base, "Flux2", type("DummyFlux2", (), {}))
+    is_flux = isinstance(model.model, FluxClass) or isinstance(model.model, Flux2Class)
+    if is_flux:
+        context_dim = model.model.model_config.unet_config.get("context_in_dim", 4096)
+        y_dim = model.model.model_config.unet_config.get("vec_in_dim", 768)
+        # Flux2 specific
+        if isinstance(model.model, Flux2Class):
+            context_len = 512
+        else:
+            context_len = 4096
+
+    if is_flux:
+        input_names = ["x", "timestep", "context", "y", "guidance"]
+        output_names = ["h"]
+        dynamic_axes = {
+            "x": {0: "batch", 2: "height", 3: "width"},
+            "timestep": {0: "batch"},
+            "context": {0: "batch", 1: "txt_len"},
+            "y": {0: "batch"},
+            "guidance": {0: "batch"}
+        }
+
+        transformer_options = model.model_options.get('transformer_options', {}).copy()
+
+        class FluxWrapper(torch.nn.Module):
+            def forward(self, x, timestep, context, y, guidance):
+                return self.unet.forward(x, timestep, context, y=y, guidance=guidance, transformer_options=self.transformer_options)
+
+        _flux = FluxWrapper()
+        _flux.unet = transformer
+        _flux.transformer_options = transformer_options
+        transformer = _flux
+
+        in_channels = model.model.model_config.unet_config.get("in_channels", 64)
+
+        inputs_shapes = {
+            "x": [batch_size, in_channels, height // 8, width // 8],
+            "timestep": [batch_size],
+            "context": [batch_size, context_len, context_dim],
+            "y": [batch_size, y_dim],
+            "guidance": [batch_size]
+        }
+
+        inputs = ()
+        for name in inputs_shapes:
+            inputs += (
+                torch.zeros(
+                    inputs_shapes[name],
+                    device=comfy.model_management.get_torch_device(),
+                    dtype=dtype,
+                ),
+            )
+
+    elif context_dim is not None:
         input_names = ["x", "timesteps", "context"]
         output_names = ["h"]
         dynamic_axes = {
@@ -129,7 +195,7 @@ def convert_model_to_ONNX(onnx_tmp_dir: Union[str, os.PathLike],
             "timesteps": {0: "batch"},
             "context": {0: "batch", 1: "num_embeds"},
             }     
-        transformer_options = model.model_options['transformer_options'].copy()
+        transformer_options = model.model_options.get('transformer_options', {}).copy()
 
         class UNET(torch.nn.Module):
             def forward(self, x, timesteps, context, *args):
@@ -217,7 +283,26 @@ def convert_model_with_mgx(onnx_tmp_dir: Union[str, os.PathLike],
     onnx_file = os.path.join(onnx_tmp_dir, "model.onnx")
     
     print("Load model from ONNX.")
-    model = mgx.parse_onnx(onnx_file, map_input_dims=input_shapes) 
+
+    # Process input_shapes into map_dyn_input_dims for dynamic shapes support
+    # Assume the first dimension (batch_size) and the token/image dimensions can vary
+    map_dyn_input_dims = {}
+    for name, shape in input_shapes.items():
+        dyn_shape = []
+        for i, dim in enumerate(shape):
+            if i == 0:  # batch size
+                dyn_shape.append({"min": 1, "max": dim * 4, "optim": dim})
+            elif name in ["x", "img", "img_ids"] and i > 0: # image/token dims
+                dyn_shape.append({"min": max(1, dim // 4), "max": dim * 4, "optim": dim})
+            else:
+                dyn_shape.append({"min": dim, "max": dim, "optim": dim})
+        map_dyn_input_dims[name] = dyn_shape
+
+    try:
+        model = mgx.parse_onnx(onnx_file, map_dyn_input_dims=map_dyn_input_dims)
+    except Exception as e:
+        # Fallback to static shapes if MIGraphX version doesn't support map_dyn_input_dims
+        model = mgx.parse_onnx(onnx_file, map_input_dims=input_shapes)
 
     print("Compile model with mgx.")
     model.compile(mgx.get_target("gpu"),
