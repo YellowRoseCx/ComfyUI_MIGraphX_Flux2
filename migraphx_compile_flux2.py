@@ -14,20 +14,20 @@ class CompileFlux2MIGraphX:
                     "default": False,
                     "tooltip": "When set on false, it will try to load model from mxr file, if file exists.",},),
                 "model_type": (["flux2"], ),
-                "batch_size": ("INT", {
-                    "default": 1, "min": 1, "max": 32, "step": 1,
-                    "tooltip": "Based on value for latent.",
+                "max_batch_size": ("INT", {
+                    "default": 4, "min": 1, "max": 32, "step": 1,
+                    "tooltip": "Maximum batch size for dynamic shape compilation.",
                 },),
-                "width": ("INT", {
-                    "default": 1024, "min": 128, "max": 4096, "step": 128,
-                    "tooltip": "Must be same value as value for latent.",
+                "max_width": ("INT", {
+                    "default": 2048, "min": 128, "max": 8192, "step": 128,
+                    "tooltip": "Maximum width for dynamic shape compilation.",
                 },),
-                "height": ("INT", {
-                    "default": 1024, "min": 128, "max": 4096, "step": 128,
-                    "tooltip": "Must be same value as value for latent.",
+                "max_height": ("INT", {
+                    "default": 2048, "min": 128, "max": 8192, "step": 128,
+                    "tooltip": "Maximum height for dynamic shape compilation.",
                 },),
-                "data_type": (["bfp16", "fp16", "fp32"], {
-                    "tooltip": "Depends on diffusion model that is loaded.",
+                "data_type": (["fp16", "fp32"], {
+                    "tooltip": "GFX1030 does not natively support bfp16. Use fp16 or fp32.",
                 },),
             },
         }
@@ -39,7 +39,7 @@ class CompileFlux2MIGraphX:
     FUNCTION = "compile_on_MIGraphX"
     CATEGORY = "advanced/migraphx"
 
-    def compile_on_MIGraphX(self, model, force_compile, model_type, batch_size, height, width, data_type):
+    def compile_on_MIGraphX(self, model, force_compile, model_type, max_batch_size, max_height, max_width, data_type):
         if model_type == "flux2":
             # Real flux config requires hidden_size, etc., so we fetch it from the original model.
             conf = model.model.model_config
@@ -49,10 +49,10 @@ class CompileFlux2MIGraphX:
             print("ERROR: model not supported.")
             return ()
 
-        mxr_file_name = f"{model_type}_{batch_size}_{width}_{height}_{data_type}.mxr"
+        mxr_file_name = f"{model_type}_{max_batch_size}_{max_width}_{max_height}_{data_type}.mxr"
 
         comfy_model.diffusion_model = load_MGX_transformer_model(model, force_compile, mxr_file_name,
-                                                                batch_size, height, width, False,
+                                                                max_batch_size, max_height, max_width, False,
                                                                 data_type)
         comfy_model.memory_required = lambda *args, **kwargs: 0
 

@@ -30,9 +30,10 @@ _TORCH_TO_MGX_DTYPE_DICT = {
 
 
 class MgxTransformer:
-    def __init__(self, model, dtype):
+    def __init__(self, model, dtype, patch_size=2):
         self.model = model
         self.dtype = dtype
+        self.patch_size = patch_size
         self.model_data = torch.zeros([1])
         self._allocate_torch_tensors()
     
@@ -40,16 +41,53 @@ class MgxTransformer:
         if timesteps is None and "timestep" in kwargs:
             timesteps = kwargs["timestep"]
 
-        if "x" in self.model_data:
+        if "img" in self.model_data:
+            # We need to process the image and text ids dynamically for Flux
+            # Assuming comfy.ldm.flux.model.Flux is the unet structure
+            if hasattr(self.model, "process_img"):
+                # But self.model here is MIGraphX model, the python model is gone.
+                # So we implement process_img manually.
+                pass
+
+            bs, c, h, w = x.shape
+            patch_size = self.patch_size
+
+            # Pad
+            from einops import rearrange
+            import torch
+
+            # Simple process_img replication
+            h_len = ((h + (patch_size // 2)) // patch_size)
+            w_len = ((w + (patch_size // 2)) // patch_size)
+
+            # If we need exact flux process_img, we'd better keep a reference to the unet.
+            # But wait, MgxTransformer.__init__ doesn't keep the python unet.
+            # Let's just do it directly.
+            img = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch_size, pw=patch_size)
+
+            # generate img_ids
+            img_ids = torch.zeros((bs, h_len * w_len, 3), dtype=torch.float32, device=x.device)
+            img_ids[:, :, 1] = torch.arange(h_len, device=x.device).view(-1, 1).repeat(1, w_len).flatten()
+            img_ids[:, :, 2] = torch.arange(w_len, device=x.device).repeat(h_len)
+
+            # txt_ids
+            txt_ids = torch.zeros((bs, context.shape[1], 3), device=x.device, dtype=torch.float32)
+
+            self._copy_tensor_sync(self.model_data["img"], img)
+            self._copy_tensor_sync(self.model_data["img_ids"], img_ids)
+            self._copy_tensor_sync(self.model_data["txt"], context)
+            self._copy_tensor_sync(self.model_data["txt_ids"], txt_ids)
+
+        elif "x" in self.model_data:
             self._copy_tensor_sync(self.model_data["x"], x)
+            if "context" in self.model_data and context is not None:
+                self._copy_tensor_sync(self.model_data["context"], context)
 
         if "timestep" in self.model_data and timesteps is not None:
             self._copy_tensor_sync(self.model_data["timestep"], timesteps)
         elif "timesteps" in self.model_data and timesteps is not None:
             self._copy_tensor_sync(self.model_data["timesteps"], timesteps)
 
-        if "context" in self.model_data and context is not None:
-            self._copy_tensor_sync(self.model_data["context"], context)
         if "y" in self.model_data and y is not None:
             self._copy_tensor_sync(self.model_data["y"], y)
         if "guidance" in self.model_data and guidance is not None:
@@ -59,7 +97,19 @@ class MgxTransformer:
         self.model.run(mgx_data)
         mgx.gpu_sync()
 
-        return self.model_data[self._get_output_name(0)]
+        out = self.model_data[self._get_output_name(0)]
+
+        if "img" in self.model_data:
+            from einops import rearrange
+            patch_size = self.patch_size
+            bs, c, h_orig, w_orig = x.shape
+            h_len = ((h_orig + (patch_size // 2)) // patch_size)
+            w_len = ((w_orig + (patch_size // 2)) // patch_size)
+            img_tokens = h_len * w_len
+            out = out[:, :img_tokens]
+            out = rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=patch_size, pw=patch_size)[:,:,:h_orig,:w_orig]
+
+        return out
     
     def load_state_dict(self, sd, strict=False):
         pass
@@ -146,12 +196,14 @@ def convert_model_to_ONNX(onnx_tmp_dir: Union[str, os.PathLike],
             context_len = 4096
 
     if is_flux:
-        input_names = ["x", "timestep", "context", "y", "guidance"]
+        input_names = ["img", "img_ids", "txt", "txt_ids", "timesteps", "y", "guidance"]
         output_names = ["h"]
         dynamic_axes = {
-            "x": {0: "batch", 2: "height", 3: "width"},
-            "timestep": {0: "batch"},
-            "context": {0: "batch", 1: "txt_len"},
+            "img": {0: "batch", 1: "num_img_tokens"},
+            "img_ids": {0: "batch", 1: "num_img_tokens"},
+            "txt": {0: "batch", 1: "txt_len"},
+            "txt_ids": {0: "batch", 1: "txt_len"},
+            "timesteps": {0: "batch"},
             "y": {0: "batch"},
             "guidance": {0: "batch"}
         }
@@ -159,8 +211,8 @@ def convert_model_to_ONNX(onnx_tmp_dir: Union[str, os.PathLike],
         transformer_options = model.model_options.get('transformer_options', {}).copy()
 
         class FluxWrapper(torch.nn.Module):
-            def forward(self, x, timestep, context, y, guidance):
-                return self.unet.forward(x, timestep, context, y=y, guidance=guidance, transformer_options=self.transformer_options)
+            def forward(self, img, img_ids, txt, txt_ids, timesteps, y, guidance):
+                return self.unet.forward_orig(img, img_ids, txt, txt_ids, timesteps, y, guidance, transformer_options=self.transformer_options)
 
         _flux = FluxWrapper()
         _flux.unet = transformer
@@ -168,11 +220,17 @@ def convert_model_to_ONNX(onnx_tmp_dir: Union[str, os.PathLike],
         transformer = _flux
 
         in_channels = model.model.model_config.unet_config.get("in_channels", 64)
+        patch_size = model.model.model_config.unet_config.get("patch_size", 2)
+        h_len = ((height // 8) + (patch_size // 2)) // patch_size
+        w_len = ((width // 8) + (patch_size // 2)) // patch_size
+        num_img_tokens = h_len * w_len
 
         inputs_shapes = {
-            "x": [batch_size, in_channels, height // 8, width // 8],
-            "timestep": [batch_size],
-            "context": [batch_size, context_len, context_dim],
+            "img": [batch_size, num_img_tokens, in_channels * patch_size * patch_size],
+            "img_ids": [batch_size, num_img_tokens, 3],
+            "txt": [batch_size, context_len, context_dim],
+            "txt_ids": [batch_size, context_len, 3],
+            "timesteps": [batch_size],
             "y": [batch_size, y_dim],
             "guidance": [batch_size]
         }
@@ -290,19 +348,19 @@ def convert_model_with_mgx(onnx_tmp_dir: Union[str, os.PathLike],
     for name, shape in input_shapes.items():
         dyn_shape = []
         for i, dim in enumerate(shape):
-            if i == 0:  # batch size
-                dyn_shape.append({"min": 1, "max": dim * 4, "optim": dim})
-            elif name in ["x", "img", "img_ids"] and i > 0: # image/token dims
-                dyn_shape.append({"min": max(1, dim // 4), "max": dim * 4, "optim": dim})
-            else:
-                dyn_shape.append({"min": dim, "max": dim, "optim": dim})
+            if i == 0:  # batch size is dynamic
+                dyn_shape.append((1, dim, dim)) # (min, max, optim)
+            elif name == "x" and i in [2, 3]: # SD height and width
+                dyn_shape.append((max(1, dim // 4), dim, dim)) # (min, max, optim)
+            elif name in ["img", "img_ids"] and i == 1: # Flux image tokens
+                dyn_shape.append((max(1, dim // 4), dim, dim)) # (min, max, optim)
+            elif name in ["context", "txt", "txt_ids"] and i == 1: # text context length
+                dyn_shape.append((1, dim, dim)) # (min, max, optim)
+            else: # static dimensions (channels, dims, etc)
+                dyn_shape.append((dim, dim, dim))
         map_dyn_input_dims[name] = dyn_shape
 
-    try:
-        model = mgx.parse_onnx(onnx_file, map_dyn_input_dims=map_dyn_input_dims)
-    except Exception as e:
-        # Fallback to static shapes if MIGraphX version doesn't support map_dyn_input_dims
-        model = mgx.parse_onnx(onnx_file, map_input_dims=input_shapes)
+    model = mgx.parse_onnx(onnx_file, map_dyn_input_dims=map_dyn_input_dims)
 
     print("Compile model with mgx.")
     model.compile(mgx.get_target("gpu"),
@@ -325,6 +383,7 @@ def load_from_mxr(mxr_file_path: Union[str, os.PathLike]):
 def load_MGX_transformer_model(model: comfy.model_base.BaseModel, force_compile: bool, mxr_file_name: str,
                                 batch_size: int, height: int, width: int, context: bool, data_type: str) -> MgxTransformer:
     transformer_mgx = None
+    patch_size = model.model.model_config.unet_config.get("patch_size", 2)
     mxr_file_path = create_path(f"mgx_files/{mxr_file_name}")
     if force_compile or not os.path.isfile(mxr_file_path):
         create_dir(create_path("mgx_files"))
@@ -339,4 +398,4 @@ def load_MGX_transformer_model(model: comfy.model_base.BaseModel, force_compile:
     else:
         transformer_mgx = load_from_mxr(mxr_file_path)
         
-    return MgxTransformer(transformer_mgx, DATA_TYPES[data_type])
+    return MgxTransformer(transformer_mgx, DATA_TYPES[data_type], patch_size=patch_size)
