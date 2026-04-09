@@ -190,8 +190,8 @@ def convert_model_to_ONNX(onnx_tmp_dir: Union[str, os.PathLike],
         # Fetch dimensions safely from the underlying Flux model params
         context_dim = getattr(transformer, "params", None)
         if context_dim:
-            context_dim = transformer.params.context_in_dim
-            y_dim = transformer.params.vec_in_dim
+            context_dim = transformer.params.context_in_dim or 4096
+            y_dim = transformer.params.vec_in_dim or 768
         else:
             context_dim = 4096
             y_dim = 768
